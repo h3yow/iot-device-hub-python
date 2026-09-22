@@ -1,8 +1,5 @@
-from fastapi import FastAPI
+"""本地 IoT 设备接入平台入口：uvicorn main:app"""
 
-app = FastAPI()
+from iot_hub.api import create_app
 
-
-@app.get("/")
-def read_root():
-    return {"Hello": "World"}
+app = create_app()
