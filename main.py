@@ -9,11 +9,12 @@ import time
 from typing import Any
 
 from fastapi import FastAPI, Request
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
 from iot_hub.errors import ErrorCode, HubError
-from iot_hub.models import Scope, TelemetryMessage
+from iot_hub.models import CommandKind, Scope, TelemetryMessage
 from iot_hub.service import DeviceHubService
 
 app = FastAPI(title="IoT Device Hub")
@@ -36,6 +37,9 @@ _STATUS = {
     ErrorCode.CAMPAIGN_NOT_FOUND: 404,
     ErrorCode.RATE_LIMITED: 429,
     ErrorCode.BACKLOG_FULL: 429,
+    ErrorCode.QUEUE_FULL: 429,
+    ErrorCode.COMMAND_NOT_PENDING: 409,
+    ErrorCode.COMMAND_EXPIRED: 409,
     ErrorCode.NOT_FOUND: 404,
     ErrorCode.CONFLICT: 409,
     ErrorCode.INTERNAL: 500,
@@ -48,6 +52,28 @@ async def hub_error_handler(_: Request, exc: HubError) -> JSONResponse:
         status_code=_STATUS.get(exc.code, 500),
         content={"error": {"code": exc.code.value, "message": exc.message}},
     )
+
+
+def _is_command_api(path: str) -> bool:
+    """离线指令新接口路径判定：仅这些路径的校验错误归一化为项目错误结构。"""
+    return path.startswith("/commands") or (
+        path.startswith("/devices/") and "/commands" in path
+    )
+
+
+@app.exception_handler(RequestValidationError)
+async def validation_error_handler(request: Request,
+                                   exc: RequestValidationError) -> JSONResponse:
+    if _is_command_api(request.url.path):
+        # 新接口：字段缺失/类型不对/取值非法统一归一化，
+        # 不透出框架校验细节与原始请求内容
+        return JSONResponse(
+            status_code=400,
+            content={"error": {"code": ErrorCode.MALFORMED_PAYLOAD.value,
+                               "message": "请求字段缺失或非法"}},
+        )
+    # 既有接口保持原有 422 行为不变
+    return JSONResponse(status_code=422, content={"detail": exc.errors()})
 
 
 @app.exception_handler(Exception)
@@ -111,6 +137,19 @@ class OtaAckRequest(BaseModel):
     success: bool
 
 
+class CommandRequest(BaseModel):
+    command_id: str
+    kind: str = "command"
+    payload: dict[str, Any]
+    ttl_seconds: float
+
+
+class CommandAckRequest(BaseModel):
+    token: str
+    device_id: str
+    command_id: str
+
+
 def _parse_scopes(raw: list[str]) -> set[Scope]:
     try:
         return {Scope(s) for s in raw}
@@ -134,6 +173,21 @@ def _job_json(job) -> dict:
     return {"job_id": job.job_id, "campaign_id": job.campaign_id,
             "device_id": job.device_id, "target_version": job.target_version,
             "status": job.status.value, "ack_deadline": job.ack_deadline}
+
+
+def _command_json(cmd) -> dict:
+    return {"command_id": cmd.command_id, "device_id": cmd.device_id,
+            "kind": cmd.kind.value, "payload": cmd.payload,
+            "status": cmd.status.value, "created_at": cmd.created_at,
+            "expires_at": cmd.expires_at, "delivered_at": cmd.delivered_at,
+            "acked_at": cmd.acked_at}
+
+
+def _parse_kind(raw: str) -> CommandKind:
+    try:
+        return CommandKind(raw)
+    except ValueError:
+        raise HubError(ErrorCode.MALFORMED_PAYLOAD, "未知指令类型")
 
 
 # ---- 设备与凭据 ----
@@ -243,6 +297,38 @@ def get_campaign(campaign_id: str) -> dict:
     return {"campaign_id": campaign.campaign_id, "model": campaign.model,
             "target_version": campaign.target_version,
             "jobs": [_job_json(j) for j in campaign.jobs.values()]}
+
+
+# ---- 离线指令/配置下发 ----
+
+@app.post("/devices/{device_id}/commands", status_code=201)
+def enqueue_command(device_id: str, req: CommandRequest) -> dict:
+    cmd = hub.enqueue_command(device_id, req.command_id, _parse_kind(req.kind),
+                              req.payload, req.ttl_seconds)
+    return {"command": _command_json(cmd)}
+
+
+@app.get("/devices/{device_id}/commands")
+def list_commands(device_id: str) -> dict:
+    hub.registry.get_device(device_id)
+    return {"commands": [_command_json(c) for c in hub.commands.list_device(device_id, time.time())],
+            "pending": hub.pending_command_count(device_id)}
+
+
+@app.post("/devices/{device_id}/commands/deliver")
+def deliver_commands(device_id: str) -> dict:
+    hub.registry.get_device(device_id)
+    return {"delivered": [_command_json(c) for c in hub.deliver_commands(device_id)]}
+
+
+@app.post("/commands/ack")
+def ack_command(req: CommandAckRequest) -> dict:
+    return {"command": _command_json(hub.ack_command(req.token, req.device_id, req.command_id))}
+
+
+@app.post("/commands/sweep")
+def sweep_commands() -> dict:
+    return {"expired": [_command_json(c) for c in hub.sweep_expired_commands()]}
 
 
 # ---- 统计 ----

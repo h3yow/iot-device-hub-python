@@ -14,6 +14,7 @@ class Scope(str, Enum):
     SHADOW_READ = "shadow:read"
     SHADOW_WRITE = "shadow:write"
     OTA_ACK = "ota:ack"
+    COMMAND_ACK = "command:ack"
 
 
 @dataclass
@@ -79,6 +80,31 @@ class OtaJob:
     status: OtaJobStatus
     dispatched_at: float = 0.0
     ack_deadline: float = 0.0
+
+
+class CommandKind(str, Enum):
+    COMMAND = "command"    # 一次性指令
+    CONFIG = "config"      # 配置下发
+
+
+class CommandStatus(str, Enum):
+    QUEUED = "QUEUED"        # 待投递（设备离线或未拉取）
+    DELIVERED = "DELIVERED"  # 已补投，等待设备确认；未确认不算已执行
+    ACKED = "ACKED"          # 设备已确认，唯一生效终态
+    EXPIRED = "EXPIRED"      # 超过有效期被剔除，不再投递
+
+
+@dataclass
+class Command:
+    command_id: str            # 业务侧幂等标识（单设备内唯一）
+    device_id: str
+    kind: CommandKind
+    payload: dict[str, Any]
+    created_at: float
+    expires_at: float
+    status: CommandStatus = CommandStatus.QUEUED
+    delivered_at: float = 0.0
+    acked_at: float = 0.0
 
 
 @dataclass

@@ -11,8 +11,9 @@ import threading
 import time
 
 from .auth import DeviceRegistry
+from .commands import CommandQueue
 from .errors import ErrorCode, HubError
-from .models import OtaJob, Scope, ShadowState, TelemetryMessage
+from .models import Command, CommandKind, OtaJob, Scope, ShadowState, TelemetryMessage
 from .ota import OtaManager
 from .ratelimit import Backlog, RateLimiter
 from .shadow import ShadowStore
@@ -43,6 +44,7 @@ class DeviceHubService:
         self.telemetry = TelemetryIngestor()
         self.shadow = ShadowStore()
         self.ota = OtaManager()
+        self.commands = CommandQueue()
         self.rate_limiter = RateLimiter(10.0, 20, 1000.0, 2000)
         self.backlog = Backlog(10000)
         self.stats = Stats()
@@ -52,6 +54,10 @@ class DeviceHubService:
     def connect(self, token: str) -> str:
         device = self.registry.authenticate(token, Scope.SHADOW_READ, self._now())
         self.registry.set_online(device.device_id, True, self._now())
+        # 重连即触发离线指令补投（按入队先后，过期项已剔除）
+        delivered = self.commands.deliver(device.device_id, self._now())
+        for _ in delivered:
+            self.stats.incr("command", "delivered")
         self.stats.incr("connection", "accepted")
         return device.device_id
 
@@ -153,3 +159,56 @@ class DeviceHubService:
             except HubError:
                 return False
         return self.ota.promote_queued(campaign_id, is_online, self._now())
+
+    # ---- 离线指令/配置下发 ----
+
+    def enqueue_command(self, device_id: str, command_id: str, kind: CommandKind,
+                        payload: dict, ttl_seconds: float) -> Command:
+        """业务侧下发：设备离线时进入其待投递队列；在线设备同样入队等补投。
+
+        设备不存在 -> UNKNOWN_DEVICE；队列满 -> QUEUE_FULL；
+        与重复确认、凭据不可用均可区分。被拒不入队、不消耗额度。
+        """
+        now = self._now()
+        self.rate_limiter.acquire(device_id, now)
+        self.registry.get_device(device_id)  # UNKNOWN_DEVICE
+        try:
+            cmd, created = self.commands.enqueue(device_id, command_id, kind,
+                                                 payload, ttl_seconds, now)
+        except HubError as exc:
+            self.stats.incr("command", exc.code.value.lower())
+            raise
+        self.stats.incr("command", "enqueued" if created else "enqueue_deduplicated")
+        return cmd
+
+    def deliver_commands(self, device_id: str) -> list[Command]:
+        """重连补投：按入队先后返回未确认指令；过期项已剔除。"""
+        delivered = self.commands.deliver(device_id, self._now())
+        for _ in delivered:
+            self.stats.incr("command", "delivered")
+        return delivered
+
+    def ack_command(self, token: str, device_id: str, command_id: str) -> Command:
+        """设备确认：仅 DELIVERED 可生效；重复确认幂等，只生效一次。"""
+        now = self._now()
+        device = self.registry.authenticate(token, Scope.COMMAND_ACK, now)
+        if device.device_id != device_id:
+            self.stats.incr("command", "scope_denied")
+            raise HubError(ErrorCode.SCOPE_DENIED, "不得代其他设备确认指令")
+        try:
+            cmd, applied = self.commands.ack(device_id, command_id, now)
+        except HubError as exc:
+            self.stats.incr("command", exc.code.value.lower())
+            raise
+        self.stats.incr("command", "acked" if applied else "ack_deduplicated")
+        return cmd
+
+    def sweep_expired_commands(self) -> list[Command]:
+        """剔除全部过期指令，返回剔除清单（可解释结论）。"""
+        expired = self.commands.sweep_expired(self._now())
+        for _ in expired:
+            self.stats.incr("command", "expired")
+        return expired
+
+    def pending_command_count(self, device_id: str) -> int:
+        return self.commands.pending_count(device_id, self._now())
