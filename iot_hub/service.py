@@ -11,8 +11,9 @@ import threading
 import time
 
 from .auth import DeviceRegistry
+from .command import CommandQueue
 from .errors import ErrorCode, HubError
-from .models import OtaJob, Scope, ShadowState, TelemetryMessage
+from .models import Command, OtaJob, Scope, ShadowState, TelemetryMessage
 from .ota import OtaManager
 from .ratelimit import Backlog, RateLimiter
 from .shadow import ShadowStore
@@ -43,6 +44,7 @@ class DeviceHubService:
         self.telemetry = TelemetryIngestor()
         self.shadow = ShadowStore()
         self.ota = OtaManager()
+        self.commands = CommandQueue()
         self.rate_limiter = RateLimiter(10.0, 20, 1000.0, 2000)
         self.backlog = Backlog(10000)
         self.stats = Stats()
@@ -50,9 +52,16 @@ class DeviceHubService:
     # ---- 连接生命周期 ----
 
     def connect(self, token: str) -> str:
-        device = self.registry.authenticate(token, Scope.SHADOW_READ, self._now())
-        self.registry.set_online(device.device_id, True, self._now())
+        now = self._now()
+        device = self.registry.authenticate(token, Scope.SHADOW_READ, now)
+        self.registry.set_online(device.device_id, True, now)
+        # 重连即按发送先后补投该设备待投递指令；过期者在投递前剔除
+        delivered, expired = self.commands.drain(device.device_id, now)
         self.stats.incr("connection", "accepted")
+        for _ in delivered:
+            self.stats.incr("command", "delivered")
+        for _ in expired:
+            self.stats.incr("command", "expired")
         return device.device_id
 
     def disconnect(self, device_id: str) -> None:
@@ -153,3 +162,58 @@ class DeviceHubService:
             except HubError:
                 return False
         return self.ota.promote_queued(campaign_id, is_online, self._now())
+
+    # ---- 离线指令/配置下发 ----
+
+    def send_command(self, device_id: str, kind: str, payload: dict,
+                     idempotency_key: str, ttl: float | None = None) -> Command:
+        """业务侧下发：设备不存在明确拒绝；离线排队、在线直接投递。
+
+        任何拒绝（设备不存在/参数非法/队列超限/重复幂等键）都在状态提交前
+        返回，队列里不留半条记录，也不消耗序号与后续额度。
+        """
+        now = self._now()
+        try:
+            device = self.registry.get_device(device_id)
+        except HubError as exc:
+            self.stats.incr("command", exc.code.value.lower())
+            raise
+        try:
+            command, created = self.commands.enqueue(
+                device_id, kind, payload, idempotency_key, now,
+                ttl=ttl, online=device.online)
+        except HubError as exc:
+            self.stats.incr("command", exc.code.value.lower())
+            raise
+        if created:
+            # 在线即投递计 delivered，离线排队计 queued；幂等命中不计数
+            outcome = "delivered" if command.delivery_count > 0 else "queued"
+            self.stats.incr("command", outcome)
+        return command
+
+    def ack_command(self, token: str, device_id: str, command_id: str,
+                    success: bool) -> Command:
+        """设备确认：先鉴权（凭据不可用与队列结论可区分）再校验归属，终态只生效一次。"""
+        now = self._now()
+        self.rate_limiter.acquire(device_id, now)
+        device = self.registry.authenticate(token, Scope.COMMAND_ACK, now)
+        if device.device_id != device_id:
+            self.stats.incr("command", "scope_denied")
+            raise HubError(ErrorCode.SCOPE_DENIED, "不得代其他设备确认指令")
+        try:
+            command = self.commands.ack(device_id, command_id, success, now)
+        except HubError as exc:
+            self.stats.incr("command", exc.code.value.lower())
+            raise
+        self.stats.incr("command", command.status.value.lower())
+        return command
+
+    def sweep_expired_commands(self) -> list[Command]:
+        """清扫所有已过有效期仍未走完的指令，结论可解释。"""
+        expired = self.commands.sweep_expired(self._now())
+        for _ in expired:
+            self.stats.incr("command", "expired")
+        return expired
+
+    def pending_commands(self, device_id: str) -> list[Command]:
+        return self.commands.pending_for(device_id)

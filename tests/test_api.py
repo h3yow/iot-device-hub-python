@@ -85,3 +85,76 @@ def test_stats_endpoint(client, device):
     resp = client.get("/stats")
     assert resp.status_code == 200
     log.info("判定依据: 统计快照 %s", resp.json())
+
+
+# ---- 离线指令/配置下发 ----
+
+def test_command_offline_queue_reconnect_drain_and_ack(client, device):
+    did = device["device_id"]
+    token = device["credential"]["token"]
+    ids = []
+    for i in range(2):
+        resp = client.post(f"/devices/{did}/commands", json={
+            "kind": "config", "idempotency_key": f"k{i}",
+            "payload": {"i": i}, "ttl": 300})
+        assert resp.status_code == 201
+        assert resp.json()["command"]["status"] == "QUEUED"
+        ids.append(resp.json()["command"]["command_id"])
+    log.info("输入: 离线下发 2 条 -> QUEUED，ids=%s", [i[:6] for i in ids])
+
+    assert client.post("/connect", json={"token": token}).status_code == 200
+    resp = client.get(f"/devices/{did}/commands")
+    pending = resp.json()["pending"]
+    log.info("判定依据: 重连后按序补投 -> %s", [p["seq"] for p in pending])
+    assert [p["command_id"] for p in pending] == ids  # 发送先后即补投顺序
+
+    resp = client.post("/commands/ack", json={
+        "token": token, "device_id": did, "command_id": ids[0], "success": True})
+    assert resp.status_code == 200 and resp.json()["command"]["status"] == "SUCCEEDED"
+
+
+def test_command_malformed_normalized_to_own_error(client, device):
+    did = device["device_id"]
+    resp = client.post(f"/devices/{did}/commands", json={"kind": "config"})
+    log.info("输入: 新接口缺字段 -> %d %s", resp.status_code, resp.json())
+    assert resp.status_code == 400
+    assert resp.json()["error"]["code"] == "MALFORMED_PAYLOAD"  # 非框架 422
+    resp = client.post("/commands/ack", json={
+        "token": "any", "device_id": did, "command_id": "x"})  # 缺 success
+    log.info("输入: ack 缺 success -> %d %s", resp.status_code, resp.json())
+    assert resp.status_code == 400
+    assert resp.json()["error"]["code"] == "MALFORMED_PAYLOAD"
+
+
+def test_command_duplicate_ack_distinct_code(client, device):
+    did = device["device_id"]
+    token = device["credential"]["token"]
+    cid = client.post(f"/devices/{did}/commands", json={
+        "kind": "config", "idempotency_key": "k", "payload": {"a": 1}}).json()[
+        "command"]["command_id"]
+    client.post("/connect", json={"token": token})
+    ack_body = {"token": token, "device_id": did, "command_id": cid, "success": True}
+    assert client.post("/commands/ack", json=ack_body).status_code == 200
+    resp = client.post("/commands/ack", json=ack_body)
+    log.info("输入: 重复确认 -> %d %s", resp.status_code, resp.json())
+    assert resp.status_code == 409
+    assert resp.json()["error"]["code"] == "COMMAND_ALREADY_ACKED"
+
+
+def test_command_unknown_device_distinct_from_full(client, monkeypatch):
+    resp = client.post("/devices/ghost/commands", json={
+        "kind": "config", "idempotency_key": "k", "payload": {"a": 1}})
+    log.info("输入: 目标设备不存在 -> %d %s", resp.status_code, resp.json())
+    assert resp.status_code == 404 and resp.json()["error"]["code"] == "UNKNOWN_DEVICE"
+
+    # 把容量压到 0，验证超限结论与设备不存在可区分
+    from main import hub
+    monkeypatch.setattr(hub.commands, "_per_device_capacity", 0)
+    reg = client.post("/devices", json={
+        "device_id": "api-full-dev", "model": "m", "firmware_version": "1.0.0"})
+    assert reg.status_code == 201
+    resp = client.post("/devices/api-full-dev/commands", json={
+        "kind": "config", "idempotency_key": "k", "payload": {"a": 1}})
+    log.info("输入: 队列已满 -> %d %s", resp.status_code, resp.json())
+    assert resp.status_code == 429
+    assert resp.json()["error"]["code"] == "COMMAND_QUEUE_FULL"

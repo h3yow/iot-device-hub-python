@@ -36,6 +36,10 @@ _STATUS = {
     ErrorCode.CAMPAIGN_NOT_FOUND: 404,
     ErrorCode.RATE_LIMITED: 429,
     ErrorCode.BACKLOG_FULL: 429,
+    ErrorCode.COMMAND_QUEUE_FULL: 429,
+    ErrorCode.COMMAND_EXPIRED: 409,
+    ErrorCode.COMMAND_ALREADY_ACKED: 409,
+    ErrorCode.COMMAND_NOT_PENDING: 409,
     ErrorCode.NOT_FOUND: 404,
     ErrorCode.CONFLICT: 409,
     ErrorCode.INTERNAL: 500,
@@ -65,11 +69,13 @@ class RegisterRequest(BaseModel):
     device_id: str
     model: str
     firmware_version: str
-    scopes: list[str] = ["telemetry:write", "shadow:read", "shadow:write", "ota:ack"]
+    scopes: list[str] = ["telemetry:write", "shadow:read", "shadow:write",
+                         "ota:ack", "command:ack"]
 
 
 class CredentialRequest(BaseModel):
-    scopes: list[str] = ["telemetry:write", "shadow:read", "shadow:write", "ota:ack"]
+    scopes: list[str] = ["telemetry:write", "shadow:read", "shadow:write",
+                         "ota:ack", "command:ack"]
 
 
 class RevokeRequest(BaseModel):
@@ -118,6 +124,41 @@ def _parse_scopes(raw: list[str]) -> set[Scope]:
         raise HubError(ErrorCode.MALFORMED_PAYLOAD, "未知授权范围")
 
 
+async def _read_json_object(request: Request) -> dict:
+    """手工解析新接口请求体：字段缺失/类型不对/取值非法一律归一化为 MALFORMED_PAYLOAD，
+    不把框架校验细节或原始内容透出去。"""
+    try:
+        body = await request.json()
+    except Exception:  # noqa: BLE001
+        raise HubError(ErrorCode.MALFORMED_PAYLOAD, "请求体必须是 JSON 对象")
+    if not isinstance(body, dict):
+        raise HubError(ErrorCode.MALFORMED_PAYLOAD, "请求体必须是 JSON 对象")
+    return body
+
+
+def _require_str(body: dict, field: str) -> str:
+    value = body.get(field)
+    if not isinstance(value, str) or not value:
+        raise HubError(ErrorCode.MALFORMED_PAYLOAD, f"字段 {field} 缺失或非法")
+    return value
+
+
+def _require_payload(body: dict) -> dict:
+    value = body.get("payload")
+    if not isinstance(value, dict) or not value:
+        raise HubError(ErrorCode.MALFORMED_PAYLOAD, "字段 payload 必须为非空对象")
+    return value
+
+
+def _optional_ttl(body: dict) -> float | None:
+    ttl = body.get("ttl")
+    if ttl is None:
+        return None
+    if isinstance(ttl, bool) or not isinstance(ttl, (int, float)) or ttl <= 0:
+        raise HubError(ErrorCode.MALFORMED_PAYLOAD, "字段 ttl 必须为正数")
+    return float(ttl)
+
+
 def _cred_json(cred) -> dict:
     return {"device_id": cred.device_id, "token": cred.token,
             "scopes": sorted(s.value for s in cred.scopes),
@@ -134,6 +175,15 @@ def _job_json(job) -> dict:
     return {"job_id": job.job_id, "campaign_id": job.campaign_id,
             "device_id": job.device_id, "target_version": job.target_version,
             "status": job.status.value, "ack_deadline": job.ack_deadline}
+
+
+def _command_json(cmd) -> dict:
+    return {"command_id": cmd.command_id, "device_id": cmd.device_id,
+            "kind": cmd.kind, "payload": cmd.payload, "seq": cmd.seq,
+            "status": cmd.status.value, "created_at": cmd.created_at,
+            "expires_at": cmd.expires_at, "delivered_at": cmd.delivered_at,
+            "delivery_count": cmd.delivery_count, "acked_at": cmd.acked_at,
+            "terminal_reason": cmd.terminal_reason}
 
 
 # ---- 设备与凭据 ----
@@ -245,8 +295,54 @@ def get_campaign(campaign_id: str) -> dict:
             "jobs": [_job_json(j) for j in campaign.jobs.values()]}
 
 
+# ---- 离线指令/配置下发 ----
+
+@app.post("/devices/{device_id}/commands", status_code=201)
+async def send_command(device_id: str, request: Request) -> dict:
+    """业务侧下发配置/指令：离线进队列，重连按序补投；容量/有效期受限。"""
+    body = await _read_json_object(request)
+    kind = _require_str(body, "kind")
+    idem = _require_str(body, "idempotency_key")
+    payload = _require_payload(body)
+    ttl = _optional_ttl(body)
+    command = hub.send_command(device_id, kind, payload, idem, ttl=ttl)
+    return {"command": _command_json(command)}
+
+
+@app.post("/commands/ack")
+async def ack_command(request: Request) -> dict:
+    """设备确认指令；重复确认只给 COMMAND_ALREADY_ACKED，不重复生效。"""
+    body = await _read_json_object(request)
+    token = _require_str(body, "token")
+    device_id = _require_str(body, "device_id")
+    command_id = _require_str(body, "command_id")
+    success = body.get("success")
+    if not isinstance(success, bool):
+        raise HubError(ErrorCode.MALFORMED_PAYLOAD, "字段 success 必须为布尔值")
+    command = hub.ack_command(token, device_id, command_id, success)
+    return {"command": _command_json(command)}
+
+
+@app.get("/devices/{device_id}/commands")
+def list_commands(device_id: str) -> dict:
+    """查看设备待投递（QUEUED）与已投递待确认（PENDING）指令，按发送先后返回。"""
+    hub.registry.get_device(device_id)  # 目标设备不存在 -> UNKNOWN_DEVICE
+    queued = [_command_json(c) for c in hub.commands.queued_for(device_id)]
+    pending = [_command_json(c) for c in hub.commands.pending_for(device_id)]
+    return {"queued": queued, "pending": pending,
+            "active": len(queued) + len(pending)}
+
+
+@app.post("/commands/sweep")
+def sweep_commands() -> dict:
+    """清扫所有已过有效期仍未走完的指令。"""
+    expired = hub.sweep_expired_commands()
+    return {"expired": [_command_json(c) for c in expired]}
+
+
 # ---- 统计 ----
 
 @app.get("/stats")
 def stats() -> dict:
-    return {"stats": hub.stats.snapshot(), "backlog": len(hub.backlog)}
+    return {"stats": hub.stats.snapshot(), "backlog": len(hub.backlog),
+            "commands_active": hub.commands.count_active()}

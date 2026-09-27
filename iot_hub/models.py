@@ -14,6 +14,7 @@ class Scope(str, Enum):
     SHADOW_READ = "shadow:read"
     SHADOW_WRITE = "shadow:write"
     OTA_ACK = "ota:ack"
+    COMMAND_ACK = "command:ack"
 
 
 @dataclass
@@ -90,3 +91,28 @@ class OtaCampaign:
     ack_timeout: float
     jobs: dict[str, OtaJob] = field(default_factory=dict)  # device_id -> job
     created_at: float = field(default_factory=time.time)
+
+
+class CommandStatus(str, Enum):
+    QUEUED = "QUEUED"            # 已入队，设备离线，尚未投递
+    PENDING = "PENDING"          # 重连后已按序补投，等待设备确认；未确认不算已执行
+    SUCCEEDED = "SUCCEEDED"      # 设备确认成功，终态（只生效一次）
+    FAILED = "FAILED"            # 设备确认失败，终态
+    EXPIRED = "EXPIRED"          # 有效期内未投递/未确认，补投前剔除，终态
+
+
+@dataclass
+class Command:
+    command_id: str
+    device_id: str
+    kind: str                    # "config" 或 "command"
+    payload: dict[str, Any]
+    created_at: float            # 入队时刻，也是 FIFO 排序依据
+    expires_at: float            # created_at + ttl
+    idempotency_key: str
+    seq: int                     # 单设备内单调递增的投递序号
+    status: CommandStatus = CommandStatus.QUEUED
+    delivered_at: float = 0.0
+    delivery_count: int = 0        # 首次投递为 1；换连接重推未确认指令时累加
+    acked_at: float = 0.0
+    terminal_reason: str = ""    # 终态可解释结论（如 expired_on_drain）
