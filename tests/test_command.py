@@ -244,6 +244,208 @@ def test_cross_device_ack_scope_denied(hub, clock):
                  "跨设备确认应为 SCOPE_DENIED，不串用状态")
 
 
+# ---------- 大批量：重复下发/重复确认在历史回收后仍稳定（本次修复核心） ----------
+
+def test_resend_after_full_batch_acked_returns_original(hub, clock):
+    """队列下到接近上限 -> 重连逐条确认完 -> 拿最早一条的去重标识重发：
+    必须返回原指令（原 id/原载荷/原 seq），不新建、不改载荷、不重复排队。"""
+    hub.rate_limiter = RateLimiter(1e9, 1_000_000, 1e9, 1_000_000)
+    token = register_with_cmd_scope(hub, clock, "dev-1")
+    n = 100  # 下到单设备上限
+    cmds = [hub.send_command("dev-1", "config", {"i": i, "ver": "old"},
+                             f"batch-{i}") for i in range(n)]
+    first = cmds[0]
+    log.info("输入: 设备 dev-1 待投递下到 %d 条（上限），最早一条 key=%s id=%s 载荷=%s",
+             n, first.idempotency_key, first.command_id[:6], first.payload)
+    hub.connect(token)  # 重连：全部 QUEUED -> PENDING
+    for c in cmds:     # 逐条确认完，活动记录全部进入终态并被回收
+        hub.ack_command(token, "dev-1", c.command_id, True)
+    assert hub.commands.count_active("dev-1") == 0
+    log.info("判定依据: 全部确认后活动队列条目=%d（终态已移出活动队列）",
+             len(hub.commands._devices.get("dev-1", {})))
+
+    clock.advance(3600)  # 隔多久都一样
+    again = hub.send_command("dev-1", "command", {"ver": "NEW"}, "batch-0")  # 换 kind/载荷
+    log.info("输入: 隔 3600s 用最早去重标识 batch-0 以新载荷重发 -> id=%s 载荷=%s seq=%d",
+             again.command_id[:6], again.payload, again.seq)
+    assert again.command_id == first.command_id   # 原来那条
+    assert again.payload == {"i": 0, "ver": "old"}  # 载荷不被改写
+    assert again.seq == first.seq and again.kind == "config"
+    assert again.status == CommandStatus.SUCCEEDED  # 原终态不变
+    assert hub.commands.count_active("dev-1") == 0  # 不重新排队
+    snap_before = hub.stats.snapshot()
+    # 再多重发若干次，任意统计键都不增加
+    for _ in range(3):
+        hub.send_command("dev-1", "command", {"ver": "NEW"}, "batch-0")
+        hub.send_command("dev-1", "command", {"ver": "NEW2"}, "batch-99")
+    assert hub.stats.snapshot() == snap_before
+    log.info("判定依据: 重发未新建/未改载荷/未重排队，统计快照未变化 %s", snap_before)
+
+
+def test_repeat_ack_after_history_recycled_still_already_acked(hub, clock):
+    """早就确认过、历史活动记录已被回收的旧指令再确认：稳定 COMMAND_ALREADY_ACKED，
+    不退化成 NOT_FOUND，不改写终态；与真正没下发过的 command_id 严格区分。"""
+    hub.rate_limiter = RateLimiter(1e9, 1_000_000, 1e9, 1_000_000)
+    token = register_with_cmd_scope(hub, clock, "dev-1")
+    cmds = [hub.send_command("dev-1", "config", {"i": i}, f"k{i}") for i in range(80)]
+    oldest = cmds[0]
+    hub.connect(token)
+    for c in cmds:
+        hub.ack_command(token, "dev-1", c.command_id, True)
+    log.info("输入: 80 条全部确认（最早 id=%s 早已移出活动队列），再隔很久重复确认",
+             oldest.command_id[:6])
+    # 直接走队列层验证“记录回收后再确认”的稳定结论，不受凭据有效期干扰
+    expect_error(ErrorCode.COMMAND_ALREADY_ACKED,
+                 lambda: hub.commands.ack("dev-1", oldest.command_id, False, clock()),
+                 "回收后再确认旧指令仍应为 COMMAND_ALREADY_ACKED，不能退化为 NOT_FOUND")
+    # 原终态不被失败确认改写
+    assert hub.commands.get("dev-1", oldest.command_id).status == CommandStatus.SUCCEEDED
+    expect_error(ErrorCode.NOT_FOUND,
+                 lambda: hub.commands.ack("dev-1", "never-existed-id", True, clock()),
+                 "真正没下发过的 command_id 才是 NOT_FOUND")
+    # 隔很久（凭据过期后重签）走完整门面链路，结论依旧
+    clock.advance(7200)
+    new_token = hub.registry.issue_credential("dev-1", CMD_SCOPE, clock()).token
+    expect_error(ErrorCode.COMMAND_ALREADY_ACKED,
+                 lambda: hub.ack_command(new_token, "dev-1", oldest.command_id, True),
+                 "重签凭据后再确认旧指令仍应为 COMMAND_ALREADY_ACKED")
+    snap = hub.stats.snapshot()
+    log.info("判定依据: 旧指令再确认 already_acked=%d，succeeded 仍为 %d（不重复累加）",
+             snap.get("command/command_already_acked", 0), snap["command/succeeded"])
+    assert snap["command/succeeded"] == 80  # 重复确认不重复累加终态计数
+
+
+def test_resend_same_key_across_devices_never_mixes(hub, clock):
+    """同一去重标识在不同设备上互不影响：不跨设备返回别人的指令。"""
+    register_with_cmd_scope(hub, clock, "dev-A")
+    register_with_cmd_scope(hub, clock, "dev-B")
+    ca = hub.send_command("dev-A", "config", {"who": "A"}, "shared-key")
+    cb = hub.send_command("dev-B", "config", {"who": "B"}, "shared-key")
+    log.info("输入: dev-A/dev-B 用相同去重标识 shared-key 各发一条 -> %s / %s",
+             ca.command_id[:6], cb.command_id[:6])
+    assert ca.command_id != cb.command_id and ca.payload == {"who": "A"} \
+        and cb.payload == {"who": "B"}
+    ra = hub.send_command("dev-A", "config", {"who": "X"}, "shared-key")
+    rb = hub.send_command("dev-B", "config", {"who": "Y"}, "shared-key")
+    assert ra.command_id == ca.command_id and rb.command_id == cb.command_id
+    assert ra.payload == {"who": "A"} and rb.payload == {"who": "B"}
+    log.info("判定依据: 两设备重发各回本设备原指令，载荷互不串用")
+
+
+def test_concurrent_resend_while_acks_sweep_and_reconnect(hub, clock):
+    """多连接重连、并发确认、过期清扫与同键重发同时发生：
+    同一去重标识只受理一次，计数不重复累加，状态不跨设备串用。"""
+    hub.rate_limiter = RateLimiter(1e9, 1_000_000, 1e9, 1_000_000)
+    token = register_with_cmd_scope(hub, clock, "dev-1")
+    n = 40
+    cmds = [hub.send_command("dev-1", "config", {"i": i}, f"k{i}") for i in range(n)]
+    outcomes: list[str] = []
+    returned_ids: set[str] = set()
+    lock = threading.Lock()
+
+    def connect_worker() -> None:  # 多连接反复重连补投
+        for _ in range(4):
+            hub.connect(token)
+
+    def ack_worker() -> None:     # 并发逐条确认，每条重复确认多次
+        for c in cmds:
+            for _ in range(3):
+                try:
+                    hub.ack_command(token, "dev-1", c.command_id, True)
+                    result = "ok"
+                except HubError as exc:
+                    result = exc.code.value
+                with lock:
+                    outcomes.append(result)
+
+    def resend_worker() -> None:  # 与确认/重连并发：用旧键重发，载荷是新的
+        for i in range(n):
+            c = hub.send_command("dev-1", "command", {"i": i, "new": True}, f"k{i}")
+            with lock:
+                returned_ids.add(c.command_id)
+
+    def sweep_worker() -> None:
+        for _ in range(5):
+            hub.sweep_expired_commands()
+
+    threads = [threading.Thread(target=connect_worker),
+               threading.Thread(target=ack_worker),
+               threading.Thread(target=resend_worker),
+               threading.Thread(target=sweep_worker)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    snap = hub.stats.snapshot()
+    log.info("输入: %d 条 + 4 连接重连 x 3 次重复确认 + 同键并发重发 + 清扫", n)
+    log.info("判定依据: succeeded=%d already_acked=%d 重发返回的不同 id 数=%d",
+             snap["command/succeeded"], snap.get("command/command_already_acked", 0),
+             len(returned_ids))
+    assert snap["command/succeeded"] == n              # 终态计数每条恰好一次
+    assert returned_ids == {c.command_id for c in cmds}  # 重发全部命中原指令
+    assert len(hub.commands._idem) == n                # 去重索引无重复条目
+    # 原载荷不被并发重发改写
+    for i, c in enumerate(cmds):
+        got = hub.commands.get("dev-1", c.command_id)
+        assert got.payload == {"i": i} and got.status == CommandStatus.SUCCEEDED
+    assert hub.commands.count_active() == 0
+
+
+# ---------- 补投过期指令：业务侧可拿到逐条可解释结论 ----------
+
+def test_expired_on_drain_explainable_via_report_and_query(hub, clock):
+    token = register_with_cmd_scope(hub, clock, "dev-1")
+    c_old1 = hub.send_command("dev-1", "config", {"a": 1}, "old1", ttl=10.0)
+    c_old2 = hub.send_command("dev-1", "command", {"a": 2}, "old2", ttl=10.0)
+    clock.advance(5)
+    c_fresh = hub.send_command("dev-1", "config", {"b": 1}, "fresh", ttl=100.0)
+    clock.advance(6)  # old1/old2 过期，fresh 有效
+    device_id, delivered, expired = hub.connect_with_report(token)
+    log.info("输入: 重连补投时刻 old1/old2 过期、fresh 有效")
+    assert device_id == "dev-1"
+    assert [c.command_id for c in expired] == [c_old1.command_id, c_old2.command_id]
+    assert all(c.terminal_reason == "expired_on_drain" for c in expired)
+    assert [c.command_id for c in delivered] == [c_fresh.command_id]
+
+    # 当次结论可查（last_connect_expired），历史流水也可逐条回查（expired_for）
+    last = hub.last_connect_expired("dev-1")
+    ledger = hub.expired_commands("dev-1")
+    log.info("判定依据: 当次补投剔除 %s；过期流水 %s（含 command_id/key/payload/reason）",
+             [(c.idempotency_key, c.terminal_reason) for c in last],
+             [(c.command_id[:6], c.idempotency_key, c.payload, c.terminal_reason)
+              for c in ledger])
+    assert [c.idempotency_key for c in last] == ["old1", "old2"]
+    assert {c.idempotency_key for c in ledger} == {"old1", "old2"}
+    assert all(c.status == CommandStatus.EXPIRED for c in ledger)
+    # 后续清扫/再次重连不会让明细丢失或重复登记
+    hub.sweep_expired_commands()
+    hub.connect_with_report(token)
+    ledger2 = hub.expired_commands("dev-1")
+    assert [c.idempotency_key for c in ledger2] == ["old1", "old2"]
+
+
+def test_swept_expired_commands_remain_explainable(hub, clock):
+    register_with_cmd_scope(hub, clock, "dev-1")
+    q = hub.send_command("dev-1", "config", {"a": 1}, "q", ttl=10.0)
+    token2 = register_with_cmd_scope(hub, clock, "dev-2")
+    hub.registry.set_online("dev-2", True, clock())  # 在线下发 -> PENDING（投递后未确认）
+    p = hub.send_command("dev-2", "config", {"a": 1}, "p", ttl=10.0)
+    assert p.status == CommandStatus.PENDING
+    clock.advance(11)
+    hub.sweep_expired_commands()
+    ledger1 = {(c.idempotency_key, c.terminal_reason) for c in hub.expired_commands("dev-1")}
+    ledger2 = {(c.idempotency_key, c.terminal_reason) for c in hub.expired_commands("dev-2")}
+    log.info("判定依据: 清扫后过期流水 dev-1=%s dev-2=%s", ledger1, ledger2)
+    assert ledger1 == {("q", "expired_while_queued")}
+    assert ledger2 == {("p", "expired_while_pending")}
+    # 过期指令再确认仍是 COMMAND_EXPIRED（从账本稳定给出），且终态不改写
+    expect_error(ErrorCode.COMMAND_EXPIRED,
+                 lambda: hub.ack_command(token2, "dev-2", p.command_id, True),
+                 "已回收的过期指令再确认仍应为 COMMAND_EXPIRED")
+    assert hub.commands.get("dev-1", q.command_id).terminal_reason == "expired_while_queued"
+
+
 # ---------- 并发：多连接、并发确认、清理同时进行 ----------
 
 def test_concurrent_acks_and_sweep_consistent(hub, clock):

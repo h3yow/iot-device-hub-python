@@ -52,6 +52,15 @@ class DeviceHubService:
     # ---- 连接生命周期 ----
 
     def connect(self, token: str) -> str:
+        device_id, _, _ = self.connect_with_report(token)
+        return device_id
+
+    def connect_with_report(self, token: str) -> tuple[str, list[Command], list[Command]]:
+        """鉴权连接并返回 (device_id, delivered, expired_on_this_connect)。
+
+        expired 为本次重连补投剔除的过期指令明细（哪一条、terminal_reason），
+        业务侧可直接据此给出可解释结论；不再只有一个数量。
+        """
         now = self._now()
         device = self.registry.authenticate(token, Scope.SHADOW_READ, now)
         self.registry.set_online(device.device_id, True, now)
@@ -62,7 +71,7 @@ class DeviceHubService:
             self.stats.incr("command", "delivered")
         for _ in expired:
             self.stats.incr("command", "expired")
-        return device.device_id
+        return device.device_id, delivered, expired
 
     def disconnect(self, device_id: str) -> None:
         self.registry.set_online(device_id, False, self._now())
@@ -217,3 +226,11 @@ class DeviceHubService:
 
     def pending_commands(self, device_id: str) -> list[Command]:
         return self.commands.pending_for(device_id)
+
+    def expired_commands(self, device_id: str) -> list[Command]:
+        """该设备所有被剔除的过期指令流水（哪一条、因何原因），业务侧可逐条回查。"""
+        return self.commands.expired_for(device_id)
+
+    def last_connect_expired(self, device_id: str) -> list[Command]:
+        """该设备最近一次重连补投被剔除的过期指令明细。"""
+        return self.commands.last_drain_expired(device_id)

@@ -141,6 +141,76 @@ def test_command_duplicate_ack_distinct_code(client, device):
     assert resp.json()["error"]["code"] == "COMMAND_ALREADY_ACKED"
 
 
+def test_command_expired_on_drain_explainable(client, device):
+    """补投剔除的过期指令：connect 响应与 commands 查询都能逐条说明哪条、什么原因。"""
+    did = device["device_id"]
+    token = device["credential"]["token"]
+    for key in ("old1", "old2"):
+        resp = client.post(f"/devices/{did}/commands", json={
+            "kind": "config", "idempotency_key": key,
+            "payload": {"k": key}, "ttl": 0.02})
+        assert resp.status_code == 201
+    fresh = client.post(f"/devices/{did}/commands", json={
+        "kind": "config", "idempotency_key": "fresh",
+        "payload": {"k": "fresh"}, "ttl": 300}).json()["command"]
+    import time
+    time.sleep(0.05)  # 等 old1/old2 过期
+    resp = client.post("/connect", json={"token": token})
+    body = resp.json()
+    log.info("输入: 重连补投 -> 响应 expired_on_drain=%s",
+             [(c["idempotency_key"], c["terminal_reason"]) for c in body["expired_on_drain"]])
+    assert resp.status_code == 200
+    keys = [c["idempotency_key"] for c in body["expired_on_drain"]]
+    assert keys == ["old1", "old2"]  # 具体哪几条
+    assert all(c["terminal_reason"] == "expired_on_drain" for c in body["expired_on_drain"])
+
+    resp = client.get(f"/devices/{did}/commands")
+    listing = resp.json()
+    log.info("判定依据: 查询 expired 流水=%s pending=%s",
+             [(c["idempotency_key"], c["terminal_reason"]) for c in listing["expired"]],
+             [c["idempotency_key"] for c in listing["pending"]])
+    assert listing["expired_count"] == 2
+    assert {c["idempotency_key"] for c in listing["expired"]} == {"old1", "old2"}
+    assert [c["command_id"] for c in listing["pending"]] == [fresh["command_id"]]
+
+
+def test_command_resend_after_batch_acked_returns_original(client, device):
+    """HTTP 链路：大批量确认完后用旧去重标识重发，返回原指令而非新排队。"""
+    from main import hub
+    from iot_hub.ratelimit import RateLimiter
+    hub.rate_limiter = RateLimiter(1e9, 1_000_000, 1e9, 1_000_000)  # 排除限速干扰
+    did = device["device_id"]
+    token = device["credential"]["token"]
+    first_id = None
+    n = 100
+    for i in range(n):  # 下到单设备上限（默认 100）
+        resp = client.post(f"/devices/{did}/commands", json={
+            "kind": "config", "idempotency_key": f"b{i}", "payload": {"i": i}})
+        assert resp.status_code == 201
+        if i == 0:
+            first_id = resp.json()["command"]["command_id"]
+    client.post("/connect", json={"token": token})
+    pending = client.get(f"/devices/{did}/commands").json()["pending"]
+    for c in pending:  # 逐条确认完
+        r = client.post("/commands/ack", json={
+            "token": token, "device_id": did, "command_id": c["command_id"],
+            "success": True})
+        assert r.status_code == 200
+    # 用最早一条的去重标识、换载荷重发
+    resp = client.post(f"/devices/{did}/commands", json={
+        "kind": "command", "idempotency_key": "b0", "payload": {"i": "NEW"}})
+    again = resp.json()["command"]
+    log.info("输入: 100 条全部确认后以 b0 新载荷重发 -> id=%s status=%s payload=%s",
+             again["command_id"][:6], again["status"], again["payload"])
+    assert again["command_id"] == first_id and again["payload"] == {"i": 0}
+    assert again["status"] == "SUCCEEDED"  # 原终态
+    # 对这条早已确认的旧指令再确认：ALREADY_ACKED，而不是 NOT_FOUND
+    r = client.post("/commands/ack", json={
+        "token": token, "device_id": did, "command_id": first_id, "success": True})
+    log.info("判定依据: 旧指令再确认 -> %s", r.json()["error"]["code"])
+    assert r.status_code == 409 and r.json()["error"]["code"] == "COMMAND_ALREADY_ACKED"
+
+
 def test_command_unknown_device_distinct_from_full(client, monkeypatch):
     resp = client.post("/devices/ghost/commands", json={
         "kind": "config", "idempotency_key": "k", "payload": {"a": 1}})

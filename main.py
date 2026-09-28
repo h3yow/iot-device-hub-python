@@ -180,6 +180,7 @@ def _job_json(job) -> dict:
 def _command_json(cmd) -> dict:
     return {"command_id": cmd.command_id, "device_id": cmd.device_id,
             "kind": cmd.kind, "payload": cmd.payload, "seq": cmd.seq,
+            "idempotency_key": cmd.idempotency_key,
             "status": cmd.status.value, "created_at": cmd.created_at,
             "expires_at": cmd.expires_at, "delivered_at": cmd.delivered_at,
             "delivery_count": cmd.delivery_count, "acked_at": cmd.acked_at,
@@ -209,7 +210,11 @@ def revoke_credential(device_id: str, req: RevokeRequest) -> dict:
 
 @app.post("/connect")
 def connect(req: ConnectRequest) -> dict:
-    return {"device_id": hub.connect(req.token)}
+    device_id = hub.connect(req.token)
+    # 本次重连补投剔除的过期指令给出逐条可解释结论（哪一条、原因），不只是数量
+    expired = hub.last_connect_expired(device_id)
+    return {"device_id": device_id,
+            "expired_on_drain": [_command_json(c) for c in expired]}
 
 
 @app.post("/devices/{device_id}/disconnect")
@@ -325,12 +330,19 @@ async def ack_command(request: Request) -> dict:
 
 @app.get("/devices/{device_id}/commands")
 def list_commands(device_id: str) -> dict:
-    """查看设备待投递（QUEUED）与已投递待确认（PENDING）指令，按发送先后返回。"""
+    """查看设备待投递（QUEUED）与已投递待确认（PENDING）指令，按发送先后返回；
+    expired 为该设备历次被剔除的过期指令流水（含 terminal_reason，逐条可解释），
+    last_drain_expired 为最近一次重连补投剔除的子集，便于业务侧定位当次补投结论。"""
     hub.registry.get_device(device_id)  # 目标设备不存在 -> UNKNOWN_DEVICE
     queued = [_command_json(c) for c in hub.commands.queued_for(device_id)]
     pending = [_command_json(c) for c in hub.commands.pending_for(device_id)]
+    expired = [_command_json(c) for c in hub.expired_commands(device_id)]
+    last_drain = [_command_json(c) for c in hub.last_connect_expired(device_id)]
     return {"queued": queued, "pending": pending,
-            "active": len(queued) + len(pending)}
+            "active": len(queued) + len(pending),
+            "expired": expired,
+            "expired_count": len(expired),
+            "last_drain_expired": last_drain}
 
 
 @app.post("/commands/sweep")
