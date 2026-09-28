@@ -13,7 +13,7 @@ import time
 from .auth import DeviceRegistry
 from .command import CommandQueue
 from .errors import ErrorCode, HubError
-from .models import Command, OtaJob, Scope, ShadowState, TelemetryMessage
+from .models import Command, ExpiryConclusion, OtaJob, Scope, ShadowState, TelemetryMessage
 from .ota import OtaManager
 from .ratelimit import Backlog, RateLimiter
 from .shadow import ShadowStore
@@ -52,17 +52,27 @@ class DeviceHubService:
     # ---- 连接生命周期 ----
 
     def connect(self, token: str) -> str:
+        device_id, _, _ = self.connect_with_report(token)
+        return device_id
+
+    def connect_with_report(self, token: str
+                            ) -> tuple[str, list[Command], list[ExpiryConclusion]]:
+        """与 connect 相同，但把本次重连补投与过期剔除结论一并带回。
+
+        返回 (device_id, delivered, expired_conclusions)：业务侧可直接拿到
+        被剔除的具体指令与原因，而不只是一个汇总计数。统计仍只各计一次。
+        """
         now = self._now()
         device = self.registry.authenticate(token, Scope.SHADOW_READ, now)
         self.registry.set_online(device.device_id, True, now)
-        # 重连即按发送先后补投该设备待投递指令；过期者在投递前剔除
-        delivered, expired = self.commands.drain(device.device_id, now)
+        # 重连即按发送先后补投该设备待投递指令；过期者在投递前剔除并落可解释结论
+        delivered, expired = self.commands.drain_report(device.device_id, now)
         self.stats.incr("connection", "accepted")
         for _ in delivered:
             self.stats.incr("command", "delivered")
         for _ in expired:
             self.stats.incr("command", "expired")
-        return device.device_id
+        return device.device_id, delivered, expired
 
     def disconnect(self, device_id: str) -> None:
         self.registry.set_online(device_id, False, self._now())
@@ -217,3 +227,14 @@ class DeviceHubService:
 
     def pending_commands(self, device_id: str) -> list[Command]:
         return self.commands.pending_for(device_id)
+
+    def expired_command_conclusions(self, device_id: str,
+                                    limit: int | None = None
+                                    ) -> list[ExpiryConclusion]:
+        """查询一台设备被剔除的过期指令结论（哪一条、原因、时刻），按发生先后返回。
+
+        设备不存在明确拒绝（UNKNOWN_DEVICE）；结论与活动队列回收解耦，
+        历史指令确认/回收后仍可查。
+        """
+        self.registry.get_device(device_id)
+        return self.commands.expired_for(device_id, limit=limit)

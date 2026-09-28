@@ -71,7 +71,7 @@ def test_internal_error_normalized(client, device, monkeypatch):
     def boom(*args, **kwargs):
         raise RuntimeError("sqlite3.OperationalError: db locked at /var/lib/secret/path")
 
-    monkeypatch.setattr("main.hub.connect", boom)
+    monkeypatch.setattr("main.hub.connect_with_report", boom)
     token = device["credential"]["token"]
     resp = client.post("/connect", json={"token": token})
     log.info("输入: 内部异常 -> %d %s", resp.status_code, resp.json())
@@ -146,7 +146,6 @@ def test_command_unknown_device_distinct_from_full(client, monkeypatch):
         "kind": "config", "idempotency_key": "k", "payload": {"a": 1}})
     log.info("输入: 目标设备不存在 -> %d %s", resp.status_code, resp.json())
     assert resp.status_code == 404 and resp.json()["error"]["code"] == "UNKNOWN_DEVICE"
-
     # 把容量压到 0，验证超限结论与设备不存在可区分
     from main import hub
     monkeypatch.setattr(hub.commands, "_per_device_capacity", 0)
@@ -158,3 +157,83 @@ def test_command_unknown_device_distinct_from_full(client, monkeypatch):
     log.info("输入: 队列已满 -> %d %s", resp.status_code, resp.json())
     assert resp.status_code == 429
     assert resp.json()["error"]["code"] == "COMMAND_QUEUE_FULL"
+
+# ---- 大批量重复下发 / 过期结论可解释（HTTP 冒烟） ----
+
+def test_command_resend_same_key_after_ack_returns_original(client, device):
+    """同键重发（即便载荷不同）始终返回原指令：不新建、不改载荷、不重复排队。"""
+    did = device["device_id"]
+    token = device["credential"]["token"]
+    first = client.post(f"/devices/{did}/commands", json={
+        "kind": "config", "idempotency_key": "dup-k",
+        "payload": {"v": "original"}}).json()["command"]
+    client.post("/connect", json={"token": token})
+    ack = {"token": token, "device_id": did,
+           "command_id": first["command_id"], "success": True}
+    assert client.post("/commands/ack", json=ack).status_code == 200
+
+    # 确认之后（活动队列终态保留窗口之外也一样）拿同键、新载荷重发
+    resp = client.post(f"/devices/{did}/commands", json={
+        "kind": "command", "idempotency_key": "dup-k",
+        "payload": {"v": "TAMPERED"}})
+    log.info("输入: 已确认指令同键重发新载荷 -> %s", resp.json()["command"])
+    body = resp.json()["command"]
+    assert body["command_id"] == first["command_id"]   # 原指令
+    assert body["payload"] == {"v": "original"}        # 载荷未被改写
+    assert body["status"] == "SUCCEEDED"               # 原终态不变，不再执行
+
+    # 已确认的旧指令再确认：仍是 COMMAND_ALREADY_ACKED，不与 NOT_FOUND 混淆
+    again = client.post("/commands/ack", json=ack)
+    log.info("输入: 旧指令再确认 -> %d %s", again.status_code, again.json())
+    assert again.status_code == 409
+    assert again.json()["error"]["code"] == "COMMAND_ALREADY_ACKED"
+
+
+def test_drain_expired_conclusions_explainable_via_http(client, device, monkeypatch):
+    """补投剔除的过期指令：/connect 与查询接口都给出具体哪一条、什么原因。"""
+    from main import hub
+    did = device["device_id"]
+    token = device["credential"]["token"]
+    # 用很短 ttl 下发两条，并在进程时钟上等待过期（避免依赖全局真实时间漂移过多）
+    import time
+    for key in ("exp-1", "exp-2"):
+        resp = client.post(f"/devices/{did}/commands", json={
+            "kind": "config", "idempotency_key": key,
+            "payload": {"k": key}, "ttl": 0.2})
+        assert resp.status_code == 201
+    fresh = client.post(f"/devices/{did}/commands", json={
+        "kind": "config", "idempotency_key": "keep",
+        "payload": {"k": "keep"}, "ttl": 300}).json()["command"]
+    time.sleep(0.25)
+
+    resp = client.post("/connect", json={"token": token})
+    data = resp.json()
+    log.info("输入: 补投时 2 条过期 -> /connect expired_commands=%s",
+             data["expired_commands"])
+    assert resp.status_code == 200
+    assert [c["idempotency_key"] for c in data["delivered"]] == ["keep"]
+    expired = data["expired_commands"]
+    assert [c["idempotency_key"] for c in expired] == ["exp-1", "exp-2"]
+    assert all(c["reason"] == "expired_on_drain" for c in expired)
+    assert all(c["device_id"] == did and c["command_id"] and c["expired_at"]
+               for c in expired)
+
+    # 业务侧事后查询：具体哪几条、什么原因，而不是只有汇总数量
+    resp = client.get(f"/devices/{did}/commands/expired")
+    listing = resp.json()
+    log.info("判定依据: GET expired -> count=%d 明细=%s",
+             listing["count"], [(c["idempotency_key"], c["reason"])
+                                for c in listing["expired"]])
+    assert listing["count"] == 2
+    assert [c["idempotency_key"] for c in listing["expired"]] == ["exp-1", "exp-2"]
+    assert resp.status_code == 200
+
+    resp = client.get(f"/devices/{did}/commands/expired?limit=1")
+    assert [c["idempotency_key"] for c in resp.json()["expired"]] == ["exp-2"]
+
+    resp = client.get("/devices/ghost/commands/expired")
+    assert resp.status_code == 404
+    assert resp.json()["error"]["code"] == "UNKNOWN_DEVICE"
+    log.info("判定依据: 过期明细可查、limit 生效、未知设备 404 可区分")
+    # 模块级 hub 跨测试共享，清理本用例的时钟等待影响（无额外状态需要处理）
+    assert fresh["command_id"]

@@ -85,25 +85,74 @@ curl -s -X POST localhost:8000/devices -H 'content-type: application/json' -d \
   86400）。设备离线 -> `QUEUED`；设备在线 -> 直接 `PENDING`（已投递）。
 - **重连补投**：`POST /connect` 成功后自动执行——先剔除已过期的 `QUEUED`，再把
   其余排队指令按 `seq`（单设备单调递增，即发送先后）逐条置 `PENDING`，
-  **后发的不能插队、不漏投、不重复投递**。
+  **后发的不能插队、不漏投、不重复投递**。响应同时给出本次 `delivered` 明细与
+  `expired_commands` 过期剔除明细（见下文“过期结论怎么查”）。
 - **确认**：`POST /commands/ack`（需设备凭据的 `command:ack` scope，默认随注册签发）。
   未确认**绝不视为已执行**。
 - **查询**：`GET /devices/{id}/commands` 返回 `queued` 与 `pending` 两列；
-  `POST /commands/sweep` 清扫过期指令。
+  `GET /devices/{id}/commands/expired` 返回被剔除的过期指令**可解释结论**
+  （可选 `?limit=N` 取最近 N 条）；`POST /commands/sweep` 清扫过期指令。
+
+### 大批量下的重复下发语义（终身保证）
+
+幂等判定独立于有界活动队列，由一份**进程生命周期内不回收的幂等台账**承载：
+只要平台**受理过**某个 `(device_id, idempotency_key)`，那么无论：
+
+- 设备队列下到几十上百条、重连后逐条确认完多少条；
+- 距首次下发过了多久、活动队列回收掉多少条终态历史；
+- 多连接重连、并发确认、过期清扫是否同时在发生；
+
+用同一个去重标识再下发（哪怕这次传的是**不同载荷**）都**永远返回当初那条指令**：
+不新建、不改载荷、不重新排队、不占容量/序号、计数不重复累加，设备也不会执行第二次；
+重发拿到的 `status` 就是原指令的终态。幂等台账按 `(device_id, key)` 隔离，**不跨设备
+串用**。只有平台从未受理过的标识才会真正入队。
+
+### 重复确认语义（历史回收后仍稳定）
+
+确认状态同样登记在**不回收的终态台账**中。一条早就确认完的指令，即使其记录已被活动
+队列回收，隔任意时间再确认：
+
+- 原来确认成功/失败 -> 稳定返回 `COMMAND_ALREADY_ACKED`，原终态（`SUCCEEDED`/
+  `FAILED`）与统计**绝不被改写或重复累加**，不会退化成“指令不存在”；
+- 原来已过期 -> 稳定返回 `COMMAND_EXPIRED`；
+- 只有 `command_id` 平台确实从未受理过，才返回 `NOT_FOUND`——三种结论始终可区分。
 
 **状态机**：`QUEUED -> PENDING -> SUCCEEDED / FAILED / EXPIRED`
 
 | 情形 | 结论 |
 | --- | --- |
-| 同一条指令重复确认 / 已终态再确认 | `COMMAND_ALREADY_ACKED`，状态与统计只生效一次 |
+| 同一条指令重复确认 / 已终态（含历史已回收）再确认 | `COMMAND_ALREADY_ACKED`，状态与统计只生效一次，永不退化成 `NOT_FOUND` |
+| 同一 `idempotency_key` 重复下发（含大批量确认并回收历史后） | 返回**原指令**：不新建、不改载荷、不重新排队/计数/执行第二次 |
 | 对 `QUEUED`（尚未投递）的指令确认 | `COMMAND_NOT_PENDING` |
-| 补投前已过期的排队指令 | `EXPIRED`，结论 `expired_on_drain`，从待投递剔除 |
+| 补投前已过期的排队指令 | `EXPIRED`，结论 `expired_on_drain`，从待投递剔除并落过期台账 |
 | 清扫发现的过期指令 | `expired_while_queued`（从未投递）/ `expired_while_pending`（投递后未确认） |
-| 过期指令再确认 | `COMMAND_EXPIRED` |
+| 过期指令（含历史已回收）再确认 | `COMMAND_EXPIRED` |
+| 平台从未受理过的 `command_id` | `NOT_FOUND`，与“已确认过/已过期”严格区分 |
 | 单设备队列满（默认 100）/ 全局满（默认 10000） | `COMMAND_QUEUE_FULL`（HTTP 429），不静默丢弃 |
 | 目标设备未注册 | `UNKNOWN_DEVICE`（404），与超限/凭据问题可区分 |
 | 凭据缺失/无效/过期/越权 | 既有 `CREDENTIAL_*` / `SCOPE_DENIED`，与队列结论可区分 |
 | 字段缺失 / 类型不对 / 取值非法 | `MALFORMED_PAYLOAD`（400），不透出框架校验细节或原始请求 |
+
+### 补投过期指令的结论怎么查
+
+过期剔除不再只有一个汇总数量。每次剔除都会把**事件瞬间的不可变结论**
+（`ExpiryConclusion`）写入该设备的有界台账（默认每设备保留最近 1000 条，FIFO），
+业务侧有两个入口拿到明细：
+
+- `POST /connect` 响应的 `expired_commands`：本次重连补投被剔除的指令；
+- `GET /devices/{id}/commands/expired`（可选 `?limit=N`）：该设备历史过期结论。
+
+每条结论包含：`command_id`、`idempotency_key`、`kind`、`seq`、`created_at`、
+`expires_at`、`expired_at`（实际剔除时刻）与 `reason`：
+
+| reason | 含义 |
+| --- | --- |
+| `expired_on_drain` | 重连补投时发现排队指令已过期，投递前剔除 |
+| `expired_while_queued` | 过期清扫发现：从未投递过的排队指令 |
+| `expired_while_pending` | 过期清扫发现：已投递但设备一直未确认 |
+
+结论与活动队列回收解耦：指令确认完、队列历史被回收后仍可查；清扫结果同样可通过
+`POST /commands/sweep` 的返回（含 `terminal_reason`）与该查询接口核对。
 
 **容量与一致性约束**：
 
@@ -111,11 +160,13 @@ curl -s -X POST localhost:8000/devices -H 'content-type: application/json' -d \
   拒绝，拒绝在分配序号/写状态**之前**完成——不留半条记录、不推进 `seq`、不提前吃掉
   后续可用额度；腾出额度后新的下发立即可成功。
 - `idempotency_key` 相同的重复下发返回同一条指令，不产生第二条、不重复占额度/计数。
-- 同一设备挂多条连接、多条指令并发确认、过期清扫与重连补投同时发生时，所有状态变更
-  在同一把队列锁内"校验-提交"原子完成：每条指令最终状态一致、每台设备剩余待投递数
-  一致、`GET /stats` 中 `command/*` 计数不重复累加、不跨设备串用。
-- 终态记录保留最近 64 条/设备（超出回收），既保证内存有界，又能把"重复确认"与
-  "指令不存在（`NOT_FOUND`）"区分开。
+- 同一设备挂多条连接、多条指令并发确认、过期清扫与重连补投、同键重发同时发生时，
+  所有状态变更在同一把队列锁内"校验-提交"原子完成：每条指令最终状态一致、每台设备
+  剩余待投递数一致、`GET /stats` 中 `command/*` 计数不重复累加、不跨设备串用。
+- 活动队列里的终态记录只保留最近 64 条/设备（超出回收，保持活动队列有界）；
+  **幂等台账与终态台账不受回收影响**（进程生命周期内有效），因此“同键重发返回原
+  指令”和“历史终态可重复确认判别”在大批量下始终成立；单设备 `seq` 也不随历史回收
+  回退。过期结论台账为每设备有界 FIFO（默认 1000）。
 
 ### 与设备影子 / OTA 的关系与能力边界
 
@@ -159,8 +210,12 @@ curl -s -X POST localhost:8000/devices -H 'content-type: application/json' -d \
 1. **单元/集成测试**：`uv run pytest tests/ -v -s`，覆盖重复上报、乱序与过期数据、
    凭据吊销与轮换宽限、升级失败回退、确认超时、离线排队、并发接入与限流；以及离线
    指令的排队与重连按序补投、重复确认只生效一次、过期剔除、单设备/全局超限、
-   并发确认/清理/多连接一致性（见 `tests/test_command.py`）；每条用例日志打印输入
-   与判定依据。
+   并发确认/清理/多连接一致性（见 `tests/test_command.py`）。**大批量专项回归**
+   见 `tests/test_command_dedup.py`：近上限批量下发→重连逐条确认→历史回收后同键重发
+   必须返回原指令、回收后重复确认稳定为 `COMMAND_ALREADY_ACKED`、补投/清扫过期结论
+   可查询、多连接+并发确认+清扫+同键重发同时发生时计数与状态一致；每条用例日志打印
+   输入与判定依据。`tests/test_api.py` 含对应 HTTP 冒烟（`/connect` 过期明细、
+   `GET .../commands/expired`）。
 2. **HTTP 冒烟**：`uv run uvicorn main:app` 后用 curl 走注册 → 连接 → 遥测 →
    影子 → OTA 全链路（`tests/test_api.py` 即为例证）。离线指令本地冒烟（无需真实
    设备，先在设备**未连接**时下发，再 connect 观察自动补投与确认）：
@@ -175,10 +230,15 @@ curl -s -X POST localhost:8000/devices -H 'content-type: application/json' -d \
      -d '{"kind":"config","idempotency_key":"k1","payload":{"led":1},"ttl":300}'
    curl -s -X POST localhost:8000/devices/dev-1/commands -H 'content-type: application/json' \
      -d '{"kind":"command","idempotency_key":"k2","payload":{"reboot":true},"ttl":300}'
-   # 重连：自动按 k1 -> k2 补投
+   # 重连：自动按 k1 -> k2 补投，响应含 delivered / expired_commands 明细
    curl -s -X POST localhost:8000/connect -H 'content-type: application/json' \
      -d "{\"token\":\"$TOK\"}"
    curl -s localhost:8000/devices/dev-1/commands   # 两条均在 pending
+   # 重复下发同键（任意载荷）-> command_id 与原载荷都不变；再确认 -> ALREADY_ACKED
+   curl -s -X POST localhost:8000/devices/dev-1/commands -H 'content-type: application/json' \
+     -d '{"kind":"command","idempotency_key":"k1","payload":{"led":2}}'
+   # 过期结论查询：哪一条、什么原因、何时剔除
+   curl -s "localhost:8000/devices/dev-1/commands/expired?limit=20"
    ```
 3. 测试使用注入时钟（`DeviceHubService(now_fn=...)`），超时/过期场景确定性复现。
 
@@ -192,9 +252,9 @@ iot_hub/
   telemetry.py  # 幂等、序号、过期判定
   shadow.py     # 影子：单调版本、原子提交、新鲜度
   ota.py        # 分批下发、确认、回退、离线排队
-  command.py    # 离线指令/配置：FIFO 待投递队列、按序补投、确认幂等、有效期/容量
+  command.py    # 离线指令：FIFO 队列、按序补投、确认幂等、有效期/容量、终身幂等/终态/过期台账
   ratelimit.py  # 令牌桶限速 + 有界积压
   service.py    # 门面：组合子系统、统计计数
 main.py         # FastAPI 接口层与错误映射
-tests/          # 以异常链路为主的测试
+tests/          # 以异常链路为主的测试（test_command_dedup.py 为大批量重复下发/确认专项回归）
 ```

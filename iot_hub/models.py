@@ -116,3 +116,21 @@ class Command:
     delivery_count: int = 0        # 首次投递为 1；换连接重推未确认指令时累加
     acked_at: float = 0.0
     terminal_reason: str = ""    # 终态可解释结论（如 expired_on_drain）
+
+
+@dataclass(frozen=True)
+class ExpiryConclusion:
+    """过期剔除的可解释结论（事件发生瞬间的不可变快照）。
+
+    与活动队列的回收解耦：指令记录被回收后，业务侧仍能查到“是哪一条、
+    因为什么、在什么时候被剔除”，而不是只有一个汇总数量。
+    """
+    device_id: str
+    command_id: str
+    idempotency_key: str
+    kind: str
+    seq: int
+    created_at: float
+    expires_at: float
+    expired_at: float            # 实际判定过期/剔除的时刻
+    reason: str                  # expired_on_drain / expired_while_queued / expired_while_pending

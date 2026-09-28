@@ -180,10 +180,23 @@ def _job_json(job) -> dict:
 def _command_json(cmd) -> dict:
     return {"command_id": cmd.command_id, "device_id": cmd.device_id,
             "kind": cmd.kind, "payload": cmd.payload, "seq": cmd.seq,
+            "idempotency_key": cmd.idempotency_key,
             "status": cmd.status.value, "created_at": cmd.created_at,
             "expires_at": cmd.expires_at, "delivered_at": cmd.delivered_at,
             "delivery_count": cmd.delivery_count, "acked_at": cmd.acked_at,
             "terminal_reason": cmd.terminal_reason}
+
+
+def _expiry_json(conclusion) -> dict:
+    """过期剔除的可解释结论：具体哪一条、什么原因、何时剔除。"""
+    return {"command_id": conclusion.command_id,
+            "device_id": conclusion.device_id,
+            "idempotency_key": conclusion.idempotency_key,
+            "kind": conclusion.kind, "seq": conclusion.seq,
+            "created_at": conclusion.created_at,
+            "expires_at": conclusion.expires_at,
+            "expired_at": conclusion.expired_at,
+            "reason": conclusion.reason}
 
 
 # ---- 设备与凭据 ----
@@ -209,7 +222,11 @@ def revoke_credential(device_id: str, req: RevokeRequest) -> dict:
 
 @app.post("/connect")
 def connect(req: ConnectRequest) -> dict:
-    return {"device_id": hub.connect(req.token)}
+    """重连：自动按序补投；本次补投与过期剔除（哪一条、原因）在响应里一并给出。"""
+    device_id, delivered, expired = hub.connect_with_report(req.token)
+    return {"device_id": device_id,
+            "delivered": [_command_json(c) for c in delivered],
+            "expired_commands": [_expiry_json(c) for c in expired]}
 
 
 @app.post("/devices/{device_id}/disconnect")
@@ -331,6 +348,19 @@ def list_commands(device_id: str) -> dict:
     pending = [_command_json(c) for c in hub.commands.pending_for(device_id)]
     return {"queued": queued, "pending": pending,
             "active": len(queued) + len(pending)}
+
+
+@app.get("/devices/{device_id}/commands/expired")
+def list_expired_commands(device_id: str, limit: int | None = None) -> dict:
+    """查询补投/清扫中被剔除的过期指令结论：具体哪一条、什么原因、何时剔除。
+
+    与活动队列回收解耦：指令确认完、历史被回收后结论仍可查；
+    可选 ?limit=N 只取最近 N 条，缺省按发生先后返回全部（每设备有界 FIFO）。
+    """
+    conclusions = hub.expired_command_conclusions(device_id, limit=limit)
+    return {"device_id": device_id,
+            "expired": [_expiry_json(c) for c in conclusions],
+            "count": len(conclusions)}
 
 
 @app.post("/commands/sweep")
